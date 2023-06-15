@@ -27,6 +27,10 @@
 
 """ZDoom ACS utilities"""
 
+
+from __future__ import annotations
+import contextlib
+import logging
 import struct
 import copy
 import sys
@@ -39,12 +43,12 @@ SIG_NEW_BIG = b'ACSE'
 
 
 def _fmtrw(fmt):
-    str = struct.Struct("<" + fmt)
-    pack = str.pack
-    unpack = str.unpack
-    size = str.size
+    strct = struct.Struct(f"<{fmt}")
+    pack = strct.pack
+    unpack = strct.unpack
+    size = strct.size
 
-    del str
+    del strct
 
     def retw(self, *dats):
         for dat in dats:
@@ -80,7 +84,7 @@ def getstr(data, pos, len):
 
 def escapestr(str):
     # ACC seems to store the strings raw
-    return '"%s"' % str
+    return f'"{str.decode("utf-8")}"'
 
 
 def read_chunks(data, pos, end, markers):
@@ -96,18 +100,15 @@ def read_chunks(data, pos, end, markers):
     return chunks
 
 
-def read_strings(data, pos, ipos):
+def read_strings(data, pos, ipos) -> list[str]:
     strings = []
     numstrings = getui(data, pos)
-    for i in range(numstrings):
+    for _ in range(numstrings):
         spos = getui(data, ipos)
         ipos += 4
 
         epos = data.find(b'\0', spos)
-        if epos != -1:
-            cstr = data[spos: epos]
-        else:
-            cstr = ''
+        cstr = data[spos: epos] if epos != -1 else ''
         strings.append(cstr)
     return strings
 
@@ -131,7 +132,7 @@ def read_array(data, scode, ipos=0):
     if isinstance(data, list):
         data = data[0]
 
-    struc = struct.Struct('<' + scode)
+    struc = struct.Struct(f'<{scode}')
     size = struc.size
     cnt = (len(data) - ipos) // size
     for i in range(cnt):
@@ -156,7 +157,7 @@ class Marker(object):
             end = self.end
             io = ScriptIO(self.data, little, self.ptr, end)
             io.begin = 0
-            try:
+            with contextlib.suppress(EOFError):
                 npcodes = len(pcodes)
                 while io.addr < end:
                     addr = io.addr
@@ -172,11 +173,13 @@ class Marker(object):
                         yield '  %10d: UNKNOWN %d' % (addr - io.begin, pcd)
                         continue
 
-                    yield '  %10d: %s' % (addr - io.begin, pcodes[pcd].disassemble(io))
+                    if pcodes[pcd] is None:
+                        yield '  %10d: UNKNOWN [%d] %s' % (addr - io.begin, pcd, pcode_names[pcd])
+                        continue
+
+                    yield '  %10d: [%d] %s' % (addr - io.begin, pcd, pcodes[pcd].disassemble(io))
 
 
-            except EOFError:
-                pass
             yield ''
 
     def getlabel(self):
@@ -186,8 +189,9 @@ class Marker(object):
 class Script(Marker):
     executable = True
 
-    def __init__(self, ptr, num, type, argc):
+    def __init__(self, ptr, num, type, argc, name = None):
         Marker.__init__(self, ptr)
+        self.name = name
         self.num = num
         self.type = type
         self.argc = argc
@@ -205,17 +209,15 @@ class Script(Marker):
 
     def getheader(self):
         if self.argc:
-            argstr = '(%s)' % ', '.join('int local%d' % i for i in range(self.argc))
+            argstr = f"({', '.join('int local%d' % i for i in range(self.argc))})"
         else:
             argstr = '(void)'
 
         if self.type > 0:
-            if self.argc:
-                argstr = '%s %s' % (argstr, self.get_type())
-            else:
-                argstr = self.get_type()
-        return 'script %d %s // addr = %d, flags=%04x' % \
-               (self.num, argstr, self.ptr, self.flags)
+            argstr = f'{argstr} {self.get_type()}' if self.argc else self.get_type()
+
+        return 'script %s %s // addr = %d, flags=%04x' % \
+                       (self.name or str(self.num), argstr, self.ptr, self.flags)
 
     def __repr__(self):
         return 'Script(%d, %d, %d, %d)' % (self.num, self.type, self.ptr, self.argc)
@@ -224,7 +226,7 @@ class Script(Marker):
 class Function(Marker):
     executable = True
 
-    def __init__(self, ptr, idx, argc, locals, hasreturn, importnum):
+    def __init__(self, ptr, idx, argc, locals, hasreturn, importnum, name):
         Marker.__init__(self, ptr, 'function %d (%d, %d, %d) -> %d' %
                         (idx, argc, locals, importnum, hasreturn))
         self.idx = idx
@@ -233,17 +235,17 @@ class Function(Marker):
         self.locals = locals
         self.isvoid = not hasreturn
         self.importnum = importnum
+        self.name = name.decode('utf8') or f'func{idx}'
         if not self.ptr:
             self.executable = False
 
     def getheader(self):
         firstvar = 0
         if self.argc:
-            argstr = '(%s)' % ', '.join('int local%d' % i for i in range(self.argc))
+            argstr = f"({', '.join('int local%d' % i for i in range(self.argc))})"
         else:
             argstr = '(void)'
-        return 'function %s func%d %s // addr = %d' % \
-               (('void' if self.isvoid else 'int'), self.idx, argstr, self.ptr)
+        return 'function %s %s %s // addr = %d' % (('void' if self.isvoid else 'int'), self.name, argstr, self.ptr)
 
 
 class ScriptIO(object):
@@ -323,7 +325,7 @@ class Behavior(object):
             if dirofs >= 24:
                 chunkofs = datalen
                 pretag = getstr(data, dirofs - 4, 4)
-                if pretag == SIG_NEW_LITTLE or pretag == SIG_NEW_BIG:
+                if pretag in [SIG_NEW_LITTLE, SIG_NEW_BIG]:
                     sig = pretag
                     chunkofs = getui(data, dirofs - 8)
                     datalen = dirofs - 1
@@ -335,15 +337,15 @@ class Behavior(object):
             numscripts = getui(data, dirofs)
             ipos = dirofs + 4
 
-            for i in range(numscripts):
+            for _ in range(numscripts):
                 snum = getui(data, ipos)
                 ptr = getui(data, ipos + 4)
                 argc = getui(data, ipos + 8)
                 ipos += 12
 
                 num = snum % 1000
-                type = snum // 1000
-                cscript = Script(ptr, num, type, argc)
+                script_type = snum // 1000
+                cscript = Script(ptr, num, script_type, argc)
                 scripts.append(cscript)
                 markers.append(cscript)
 
@@ -359,62 +361,64 @@ class Behavior(object):
         else:
             chunks = read_chunks(data, chunkofs, datalen, markers)
             estrings = chunks.get(b'STRE')
-            ustrings = chunks.get(b'STRL')
-
-            if ustrings:
+            if ustrings := chunks.get(b'STRL'):
                 strings = read_strings(ustrings[0], 4, 12)
 
-            for i, argcount, localcount, hasreturnval, importnum, ptr in \
-                    read_array(chunks.get(b'FUNC'), 'BBBBI'):
-                cfunc = Function(ptr, len(functions), argcount, localcount,
-                                 hasreturnval, importnum)
+            function_names = []
+            if function_names_chunk := chunks.get(b'FNAM'):
+                function_names = read_strings(function_names_chunk[0], 0, 4)
+
+            if map_names_chunk := chunks.get(b'MEXP'): # TODO untested
+                map_names = read_strings(map_names_chunk[0], 0, 4)
+                for num, name in enumerate(map_names):
+                    mvar = mapvars.getvar(num)
+                    mvar.name = name.decode('utf8')
+
+            script_names = []
+            if script_names_chunk := chunks.get(b'SNAM'):
+                script_names = read_strings(script_names_chunk[0], 0, 4)
+
+            for i, argcount, localcount, hasreturnval, importnum, ptr in read_array(chunks.get(b'FUNC'), 'BBBBI'):
+                cfunc = Function(ptr, len(functions), argcount, localcount, hasreturnval, importnum, function_names[i])
 
                 functions.append(cfunc)
                 markers.append(cfunc)
 
-            if is_intermediate:
-                for i, num, type, addr, argc in \
-                        read_array(chunks.get(b'SPTR'), 'HHII'):
-                    cscript = Script(addr, num, type, argc)
-                    scriptnum[num] = cscript
-                    markers.append(cscript)
-            else:
-                for i, num, type, argc, addr in \
-                        read_array(chunks.get(b'SPTR'), 'HBBI'):
-                    cscript = Script(addr, num, type, argc)
-                    scriptnum[num] = cscript
-                    markers.append(cscript)
+            def add_script(addr, num, type, argc):
+                script_name = str(num) if num > 0 else escapestr(script_names[-num - 1])
+                cscript = Script(addr, num, type, argc, script_name)
+                scriptnum[num] = cscript
+                markers.append(cscript)
 
-            mvar_init_data = chunks.get(b'MINI', [None])[0]
-            if mvar_init_data:
+            if is_intermediate:
+                for i, num, type, addr, argc in read_array(chunks.get(b'SPTR'), 'hHII'):
+                    add_script(addr, num, type, argc)
+            else:
+                for i, num, type, argc, addr in read_array(chunks.get(b'SPTR'), 'hBBI'):
+                    add_script(addr, num, type, argc)
+
+            if mvar_init_data := chunks.get(b'MINI', [None])[0]:
                 cvar = getui(mvar_init_data, 0)
                 for i, mvar in read_array(mvar_init_data, 'i', 4):
                     mapvars.getvar(i + cvar).initval = mvar
 
-            for i, num, size in \
-                    read_array(chunks.get(b'ARAY'), 'II'):
+            for i, num, size in read_array(chunks.get(b'ARAY'), 'II'):
                 mvar = mapvars.getvar(num)
                 mvar.isarray = True
                 mvar.initval = [0] * size
 
             for idata in chunks.get(b'AINI', []):
                 anum = getui(idata, 0)
-                try:
+                with contextlib.suppress(KeyError, IndexError, AttributeError):
                     mvar = mapvars.getvar(anum)
                     elem = mvar.initval
                     if isinstance(elem, list):
                         for i, val in read_array(idata, 'i', 4):
                             elem[i] = val
-                except (KeyError, IndexError, AttributeError):
-                    pass
-
-            for i, num, flags in \
-                    read_array(chunks.get(b'SFLG'), 'HH'):
-
-                try:
+            for i, num, flags in read_array(chunks.get(b'SFLG'), 'HH'):
+                with contextlib.suppress(KeyError):
                     scriptnum[num].flags = flags
-                except KeyError:
-                    pass
+
 
         markers.append(Marker(len(data), 'End'))
 
@@ -426,20 +430,22 @@ class Behavior(object):
             cc.data = data
             cc.little = self.little
         self.strings = strings
+        self.script_names = script_names
         self.data = data
 
     def lookupvar(self, type, id):
         return self.vars[type].getvar(id)
 
-    def decompile(self, addr):
-        """Attempt to decompile script or function at addr.
-
-        Returns an Interpreter object.
-        """
-
-        intp = Interpreter(self)
-        intp.decompile(addr)
-        return intp
+# unused
+#    def decompile(self, addr):
+#        """Attempt to decompile script or function at addr.
+#
+#        Returns an Interpreter object.
+#        """
+#
+#        intp = Interpreter(self)
+#        intp.decompile(addr)
+#        return intp
 
     def getstring(self, val):
         """Attempt to convert a number to a string.
@@ -489,10 +495,10 @@ class Expression(StackItem):
         return self
 
     def tocode(self, p):
-        return '/* not implemented for %s */' % type(self).__name__
+        return f'/* not implemented for {type(self).__name__} */'
 
     def genlines(self, p):
-        return (self.tocode(p) + ';',)
+        return (f'{self.tocode(p)};', )
 
     def put_block(self, p, block):
         block.put(self)
@@ -527,8 +533,7 @@ class Block(Expression):
 
     def genlines(self, p):
         for s in self.statements:
-            for l in s.genlines(p):
-                yield l
+            yield from s.genlines(p)
 
 
 class Target(Expression):
@@ -593,7 +598,7 @@ class Parser(ScriptIO):
         return self.behavior.lookupvar(type, id)
 
     def goto_code(self, tgt):
-        return 'goto %s' % tgt.label
+        return f'goto {tgt.label}'
 
     def restart_code(self):
         return 'restart'
@@ -633,8 +638,8 @@ class Parser(ScriptIO):
             id, func, args = q.popleft()
             try:
                 func(*args)
-            except:
-                print('<failed id was %d>' % id)
+            except Exception as e:
+                print(f'<failed id was {id}>')
                 raise
 
     def queue(self, func, *args):
@@ -662,7 +667,7 @@ class Parser(ScriptIO):
             pcd = readui(self)
 
         if pcd >= len(pcodes):
-            print("Unsupported pcode {}".format(pcd))
+            print(f"Unsupported pcode {pcd}")
             pcd = pcodes[pcode_index['TERMINATE']]
         else:
             pcd = pcodes[pcd]
@@ -781,7 +786,7 @@ class ArrayIndex(Expression):
         return (self.arr, self.index)
 
     def tocode(self, p):
-        return '%s[%s]' % (self.arr.tocode(p), self.index.tocode(p))
+        return f'{self.arr.tocode(p)}[{self.index.tocode(p)}]'
 
     @classmethod
     def parse(cls, p, id, clas):
@@ -794,10 +799,12 @@ class Variable(Expression):
     initval = 0
     can_be_array = True
     isarray = False
+    name = None
 
     def __init__(self, id):
         Expression.__init__(self)
         self.id = id
+        self.name = f'{self.type}{self.id}'
         self.assigns = set()
 
     def lookupstring(self, p):
@@ -821,7 +828,7 @@ class Variable(Expression):
         return str(self.id)
 
     def tocode(self, p):
-        return '%s%d' % (self.type, self.id)
+        return self.name
 
     @classmethod
     def parse(cls, p, id):
@@ -862,7 +869,7 @@ class Push(Instruction):
         Instruction.parse(self, p)
 
     def disassemble(self):
-        return '%s %s' % (self.pcode.name, ', '.join(v.disassemble() for v in self.values))
+        return f"{self.pcode.name} {', '.join(v.disassemble() for v in self.values)}"
 
 
 class Assign(Instruction):
@@ -888,11 +895,10 @@ class Assign(Instruction):
         Instruction.parse_block(self, p, block)
 
     def disassemble(self):
-        return '%s %s' % (self.pcode.name, self.dest.tocode(None))
+        return f'{self.pcode.name} {self.dest.tocode(None)}'
 
     def tocode(self, p):
-        return '%s %s %s' % (self.dest.tocode(p), self.op,
-                             self.val.tocode(p))
+        return f'{self.dest.tocode(p)} {self.op} {self.val.tocode(p)}'
 
 
 class InPlaceUnary(Instruction):
@@ -907,10 +913,10 @@ class InPlaceUnary(Instruction):
         Instruction.parse_block(self, p, block)
 
     def disassemble(self):
-        return '%s %s' % (self.pcode.name, self.dest.tocode(None))
+        return f'{self.pcode.name} {self.dest.tocode(None)}'
 
     def tocode(self, p):
-        return '%s%s' % (self.dest.tocode(p), self.op)
+        return f'{self.dest.tocode(p)}{self.op}'
 
 
 bin_opers = {
@@ -950,17 +956,13 @@ class BinOperator(Instruction):
         rcv = self.right.constvalue()
         lcv = self.left.constvalue()
         if rcv is not None and lcv is not None:
-            try:
+            with contextlib.suppress(ZeroDivisionError):
                 self.constval = bin_opers[op](lcv, rcv)
-            except ZeroDivisionError:
-                pass
-
         p.push(self)
         Instruction.parse(self, p)
 
     def tocode(self, p):
-        return '(%s %s %s)' % (self.left.tocode(p), self.op,
-                               self.right.tocode(p))
+        return f'({self.left.tocode(p)} {self.op} {self.right.tocode(p)})'
 
 
 class UnaryOperator(Instruction):
@@ -969,16 +971,13 @@ class UnaryOperator(Instruction):
         self.op = op
         rcv = self.right.constvalue()
         if rcv is not None:
-            try:
+            with contextlib.suppress(ZeroDivisionError):
                 self.constval = unary_opers[op](rcv)
-            except ZeroDivisionError:
-                pass
-
         p.push(self)
         Instruction.parse(self, p)
 
     def tocode(self, p):
-        return '%s%s' % (self.op, self.right.tocode(p))
+        return f'{self.op}{self.right.tocode(p)}'
 
 
 class Comment(Expression):
@@ -986,7 +985,7 @@ class Comment(Expression):
         self.txt = txt
 
     def tocode(self, p):
-        return '/* %s */' % self.txt
+        return f'/* {self.txt} */'
 
     def __repr__(self):
         return 'Comment(%r)' % self.txt
@@ -1180,7 +1179,7 @@ class SwitchExpr(Expression):
         for c in self.cases:
             yield '    case %d:' % c.case
             for l in c.block.genlines(p):
-                yield '        %s' % l
+                yield f'        {l}'
         yield '}'
 
 
@@ -1259,9 +1258,9 @@ class PrintExpr(Expression):
         itemcode = ', '.join(i.tocode(p) for i in self.items)
         if self.optargs is not None:
             argcode = ', '.join(i.tocode(p) for i in self.optargs)
-            return '%s(%s; %s)' % (self.name, itemcode, argcode)
+            return f'{self.name}({itemcode}; {argcode})'
 
-        return '%s(%s)' % (self.name, itemcode)
+        return f'{self.name}({itemcode})'
 
     def finish(self, name, optargs=None):
         self.name = name
@@ -1285,15 +1284,12 @@ class PrintItem(Instruction):
         self.code = code
         self.val = self.interpret(p.pop(), p)
         pr = p.top
-        try:
+        with contextlib.suppress(Exception):
             pr.appenditem(self)
-        except Exception:
-            pass
-
         Instruction.parse(self, p)
 
     def tocode(self, p):
-        return '%s:%s' % (self.code, self.val.tocode(p))
+        return f'{self.code}:{self.val.tocode(p)}'
 
     @staticmethod
     def interpret(val, p):
@@ -1325,7 +1321,7 @@ class CreateTranslation(Instruction):
 
 class TranslationRange(Instruction):
     def tocode(self, p):
-        args = tuple([e.tocode(p) for e in self.args])
+        args = tuple(e.tocode(p) for e in self.args)
         if len(args) == 8:
             return '%s:%s = [%s, %s, %s]:[%s, %s, %s]' % args
         return '%s:%s = %s:%s' % args
@@ -1333,10 +1329,8 @@ class TranslationRange(Instruction):
     def parse(self, p, nargs):
         self.args = p.pop(nargs)
         pr = p.top
-        try:
+        with contextlib.suppress(Exception):
             pr.appenditem(self)
-        except Exception:
-            pass
         Instruction.parse(self, p)
 
 
@@ -1346,10 +1340,8 @@ class EndPrint(Instruction):
     def parse(self, p, name):
         self.name = name
         self.pi = p.pop()
-        try:
+        with contextlib.suppress(Exception):
             self.pi.finish(name)
-        except Exception:
-            pass
         Instruction.parse(self, p)
 
     def parse_block(self, p, block):
@@ -1381,10 +1373,8 @@ class HudMessage(Instruction):
         args = p.pop(6)
 
         self.pi = p.pop()
-        try:
+        with contextlib.suppress(Exception):
             self.pi.finish(self.name, args + opt)
-        except Exception:
-            pass
         Instruction.parse(self, p)
 
     def parse_block(self, p, block):
@@ -1394,14 +1384,14 @@ class HudMessage(Instruction):
 
 class Call(Instruction):
     def tocode(self, p):
-        return 'func%d(%s)' % (self.funcnum,
-                               ', '.join(e.tocode(p) for e in self.args))
+        return f"{self.name}({', '.join(e.tocode(p) for e in self.args)})"
 
-    def parse(self, p, inst_args, wantresult):
+    def parse(self, p: Parser, inst_args, wantresult):
         funcnum = inst_args[0]
         func = p.getfunc(funcnum)
         args = p.pop(func.argc)
 
+        self.name = func.name
         self.funcnum = funcnum
         self.args = args
         self.wantresult = wantresult
@@ -1418,22 +1408,65 @@ class Call(Instruction):
     def disassemble(self):
         return '%s %d' % (self.pcode.name, self.funcnum)
 
+# CALLFUNC special
+class CallExtension(Instruction):
+    def tocode(self, p):
+        return f"{ext_specials[-self.specialnum]}({', '.join(e.tocode(p) for e in self.args)})"
+
+    def parse(self, p, inst_args):
+        argc = inst_args[0]
+        specialnum = inst_args[1]
+        args = p.pop(argc)
+
+        self.specialnum = specialnum
+        self.args = args
+
+        p.push(self)
+        Instruction.parse(self, p)
+
+    def parse_block(self, p, block):
+        #if(not(self.wantresult)):
+        #    block.put(self)
+        Instruction.parse_block(self, p, block)
+
+    def disassemble(self):
+        return '%s %d:%s' % (self.pcode.name, -self.specialnum, ext_specials[-self.specialnum])
+
 
 class ReturnVoid(Terminal):
     def tocode(self, p):
         if not self.void:
-            return 'return %s' % self.stack.tocode(p)
+            return f"return {self.stack.tocode(p) if self.stack is not stackbottom else '0 /*ERR:StackBottom*/'}";
         return 'return'
 
 
 class Return(ReturnVoid):
     void = False
 
+class SaveString(Instruction):
+    def tocode(self, p):
+        return f"StrParam({', '.join(e.tocode(p) for e in self.args)})"
+
+    def parse(self, p):
+        args = p.pop().items
+
+        #self.specialnum = specialnum
+        self.args = args
+
+        p.push(self)
+        Instruction.parse(self, p)
+
+    #def parse_block(self, p, block):
+    #    #if(not(self.wantresult)):
+    #    #    block.put(self)
+    #    Instruction.parse_block(self, p, block)
+
+    #def disassemble(self):
+    #    return '%s %d:%s' % (self.pcode.name, -self.specialnum, ext_specials[-self.specialnum])
 
 class ArgumentInterpreter(object):
     def convert(self, p, args):
-        for val in args:
-            yield val
+        yield from args
 
 
 default_interp = ArgumentInterpreter()
@@ -1446,10 +1479,8 @@ class ConvStrings(ArgumentInterpreter):
     def convert(self, p, args):
         for i, val in enumerate(args):
             if i in self.indices:
-                try:
+                with contextlib.suppress(Exception):
                     val = val.lookupstring(p)
-                except Exception:
-                    pass
             yield val
 
 
@@ -1458,13 +1489,9 @@ class ActorPropArgs(ArgumentInterpreter):
         val1 = args[0]
         valstring = False
         if isinstance(val1, Literal):
-            try:
+            with contextlib.suppress(Exception):
                 name, valstring = aprop_names[val1.val]
                 val1 = ConstantReference(name, val1.val)
-            except Exception:
-                pass
-
-
         val2 = args[1]
         if valstring:
             val2 = val2.lookupstring(val2)
@@ -1472,16 +1499,15 @@ class ActorPropArgs(ArgumentInterpreter):
         yield val2
         yield val1
 
-        for i in args[2:]:
-            yield i
+        yield from args[2:]
 
 
 class BuiltinCall(Instruction):
     def tocode(self, p):
         argcode = ', '.join(e.tocode(p) for e in self.args)
         if self.const:
-            return '%s(const: %s)' % (self.name, argcode)
-        return '%s(%s)' % (self.name, argcode)
+            return f'{self.name}(const: {argcode})'
+        return f'{self.name}({argcode})'
 
     def parse(self, p, args, void, name, interp=default_interp):
         if isinstance(args, int):
@@ -1514,10 +1540,7 @@ class BuiltinCall(Instruction):
 class LineSpec(BuiltinCall):
     def parse(self, p, inst_args, nargs, void=True):
         self.lspec = inst_args[0]
-        specname = None
-        if self.lspec < 255:
-            specname = linespecials[self.lspec]
-
+        specname = linespecials[self.lspec] if self.lspec < 255 else None
         if specname is None:
             specname = 'LineSpec%d' % self.lspec
 
@@ -1553,14 +1576,14 @@ class IntegerArgCode(ArgCode):
 class VarArgCode(ArgCode):
     def _parse(self, s):
         cnt = readub(s)
-        for i in range(cnt):
+        for _ in range(cnt):
             yield readub(s)
 
     def parse(self, s):
         return list(self._parse(s))
 
     def disassemble(self, s):
-        for i in self._parse(s):
+        for _ in self._parse(s):
             yield '%d' % s
 
 
@@ -1577,6 +1600,7 @@ argcodes = dict(
     I=IntegerArgCode(readui),
     V=IntegerArgCode(readub, readui),
     B=IntegerArgCode(readub),
+    S=IntegerArgCode(readus, readui),
     i=IntegerArgCode(readsi),
     v=IntegerArgCode(readsb, readsi),
     b=IntegerArgCode(readsb),
@@ -1615,18 +1639,17 @@ class ArgPCode(PCode):
 
     def getargs(self, s):
         for ac in self.codes:
-            for v in ac.disassemble(s):
-                yield v
+            yield from ac.disassemble(s)
 
     def disassemble(self, s):
-        return '%s %s' % (self.name, ', '.join(self.getargs(s)))
+        return f"{self.name} {', '.join(self.getargs(s))}"
 
 
 class CasePCode(PCode):
     def parse(self, p, addr):
         p.wordalign()
         numcases = readui(p)
-        cases = [(readui(p), readui(p)) for i in range(numcases)]
+        cases = [(readui(p), readui(p)) for _ in range(numcases)]
 
         ret = self.create(p, addr)
         ret.parse(p, cases, *self.args)
@@ -1635,13 +1658,13 @@ class CasePCode(PCode):
     def disassemble(self, s):
         s.wordalign()
         numcases = readui(s)
-        return self.name + ' ' + ', '.join('%d: %d' % (readui(s), readui(s) - s.begin) for i in range(numcases))
+        return f'{self.name} ' + ', '.join('%d: %d' % (readui(s), readui(s) - s.begin) for _ in range(numcases))
 
 
 class PushBytesPCode(PCode):
     def parse(self, p, addr):
         cnt = readub(p)
-        inst_args = [readub(p) for i in range(cnt)]
+        inst_args = [readub(p) for _ in range(cnt)]
 
         ret = self.create(p, addr)
         ret.parse(p, inst_args, *self.args)
@@ -1649,11 +1672,11 @@ class PushBytesPCode(PCode):
 
     def getargs(self, s):
         cnt = readub(s)
-        for v in range(cnt):
+        for _ in range(cnt):
             yield '%d' % readub(s)
 
     def disassemble(self, s):
-        return '%s %s' % (self.name, ', '.join(self.getargs(s)))
+        return f"{self.name} {', '.join(self.getargs(s))}"
 
 
 def genpcodes():
@@ -1674,7 +1697,7 @@ def genpcodes():
         pcode(name.upper(), BuiltinCall, arg, void, name, interp)
 
     def builtin_direct(name, arg, void=True, interp=default_interp):
-        apcode(name.upper() + 'DIRECT', 'I' * arg, BuiltinCall, void, name, interp)
+        apcode(f'{name.upper()}DIRECT', 'I' * arg, BuiltinCall, void, name, interp)
 
     def builtin_both(name, arg, void=True, interp=default_interp):
         builtin_stack(name, arg, void, interp)
@@ -1694,9 +1717,10 @@ def genpcodes():
     # Functions
     apcode('CALL', 'V', Call, True)
     apcode('CALLDISCARD', 'V', Call, False)
-    apcode('CALLFUNC', 'V', Call, True)
+    apcode('CALLFUNC', 'VS', CallExtension)
     pcode('RETURNVOID', ReturnVoid, 'return')
     pcode('RETURNVAL', Return, 'return')
+    pcode('SAVESTRING', SaveString)
 
     # Stack ops
     pcode('DUP', DupInst)
@@ -1724,13 +1748,13 @@ def genpcodes():
     apcode('LSPEC3', 'V', LineSpec, 3)
     apcode('LSPEC4', 'V', LineSpec, 4)
     apcode('LSPEC5', 'V', LineSpec, 5)
-    apcode('LSPEC6', 'V', LineSpec, 6)
+    #apcode('LSPEC6', 'V', LineSpec, 6)
     apcode('LSPEC1DIRECT', 'VI', LineSpec, 0)
     apcode('LSPEC2DIRECT', 'VII', LineSpec, 0)
     apcode('LSPEC3DIRECT', 'VIII', LineSpec, 0)
     apcode('LSPEC4DIRECT', 'VIIII', LineSpec, 0)
     apcode('LSPEC5DIRECT', 'VIIIII', LineSpec, 0)
-    apcode('LSPEC6DIRECT', 'VIIIIII', LineSpec, 0)
+    #apcode('LSPEC6DIRECT', 'VIIIIII', LineSpec, 0)
     apcode('LSPEC5RESULT', 'V', LineSpec, 5, False)
 
     # Math
@@ -1830,7 +1854,7 @@ def genpcodes():
     builtin_stack('PlayerGoldSkull', 0, False)
     builtin_stack('PlayerBlackCard', 0, False)
     builtin_stack('PlayerSilverCard', 0, False)
-    builtin_stack('PlayerOnTeam', 0, False)
+    #builtin_stack('PlayerOnTeam', 0, False)
     builtin_stack('PlayerTeam', 0, False)
     builtin_stack('PlayerHealth', 0, False)
     builtin_stack('PlayerArmorPoints', 0, False)
@@ -1938,7 +1962,7 @@ def genpcodes():
     builtin_stack('ThingCountName', 2, False, ConvStrings(0))
     builtin_stack('SpawnSpotFacing', 3, False, ConvStrings(0))
     builtin_stack('PlayerClass', 1, False)
-    builtin_stack('StrParam', 1, False)
+    #builtin_stack('StrParam', 1, False)
 
     pcode('STARTTRANSLATION', CreateTranslation)
     pcode('TRANSLATIONRANGE1', TranslationRange, 4)
@@ -1971,123 +1995,399 @@ def genpcodes():
 
 
 pcode_names = [
-    'NOP', 'TERMINATE', 'SUSPEND',
-    'PUSHNUMBER', 'LSPEC1', 'LSPEC2', 'LSPEC3',
-    'LSPEC4', 'LSPEC5', 'LSPEC1DIRECT', 'LSPEC2DIRECT',
-    'LSPEC3DIRECT', 'LSPEC4DIRECT', 'LSPEC5DIRECT', 'ADD',
-    'SUBTRACT', 'MULTIPLY', 'DIVIDE', 'MODULUS', 'EQ',
-    'NE', 'LT', 'GT', 'LE', 'GE',
-    'ASSIGNSCRIPTVAR', 'ASSIGNMAPVAR', 'ASSIGNWORLDVAR',
-    'PUSHSCRIPTVAR', 'PUSHMAPVAR', 'PUSHWORLDVAR',
-    'ADDSCRIPTVAR', 'ADDMAPVAR', 'ADDWORLDVAR',
-    'SUBSCRIPTVAR', 'SUBMAPVAR', 'SUBWORLDVAR',
-    'MULSCRIPTVAR', 'MULMAPVAR', 'MULWORLDVAR',
-    'DIVSCRIPTVAR', 'DIVMAPVAR', 'DIVWORLDVAR',
-    'MODSCRIPTVAR', 'MODMAPVAR', 'MODWORLDVAR',
-    'INCSCRIPTVAR', 'INCMAPVAR', 'INCWORLDVAR',
-    'DECSCRIPTVAR', 'DECMAPVAR', 'DECWORLDVAR', 'GOTO',
-    'IFGOTO', 'DROP', 'DELAY', 'DELAYDIRECT',
-    'RANDOM', 'RANDOMDIRECT', 'THINGCOUNT',
-    'THINGCOUNTDIRECT', 'TAGWAIT', 'TAGWAITDIRECT',
-    'POLYWAIT', 'POLYWAITDIRECT', 'CHANGEFLOOR',
-    'CHANGEFLOORDIRECT', 'CHANGECEILING',
-    'CHANGECEILINGDIRECT', 'RESTART', 'ANDLOGICAL',
-    'ORLOGICAL', 'ANDBITWISE', 'ORBITWISE', 'EORBITWISE',
-    'NEGATELOGICAL', 'LSHIFT', 'RSHIFT', 'UNARYMINUS',
-    'IFNOTGOTO', 'LINESIDE', 'SCRIPTWAIT',
-    'SCRIPTWAITDIRECT', 'CLEARLINESPECIAL', 'CASEGOTO',
-    'BEGINPRINT', 'ENDPRINT', 'PRINTSTRING',
-    'PRINTNUMBER', 'PRINTCHARACTER', 'PLAYERCOUNT',
-    'GAMETYPE', 'GAMESKILL', 'TIMER', 'SECTORSOUND',
-    'AMBIENTSOUND', 'SOUNDSEQUENCE', 'SETLINETEXTURE',
-    'SETLINEBLOCKING', 'SETLINESPECIAL', 'THINGSOUND',
-    'ENDPRINTBOLD', 'ACTIVATORSOUND', 'LOCALAMBIENTSOUND',
-    'SETLINEMONSTERBLOCKING', 'PLAYERBLUESKULL',
-    'PLAYERREDSKULL', 'PLAYERYELLOWSKULL',
-    'PLAYERMASTERSKULL', 'PLAYERBLUECARD', 'PLAYERREDCARD',
-    'PLAYERYELLOWCARD', 'PLAYERMASTERCARD',
-    'PLAYERBLACKSKULL', 'PLAYERSILVERSKULL',
-    'PLAYERGOLDSKULL', 'PLAYERBLACKCARD', 'PLAYERSILVERCARD',
-    'PLAYERONTEAM', 'PLAYERTEAM', 'PLAYERHEALTH',
-    'PLAYERARMORPOINTS', 'PLAYERFRAGS', 'PLAYEREXPERT',
-    'BLUETEAMCOUNT', 'REDTEAMCOUNT', 'BLUETEAMSCORE',
-    'REDTEAMSCORE', 'ISONEFLAGCTF', 'LSPEC6',
-    'LSPEC6DIRECT', 'PRINTNAME', 'MUSICCHANGE',
-    'CONSOLECOMMANDDIRECT', 'CONSOLECOMMAND', 'SINGLEPLAYER',
-    'FIXEDMUL', 'FIXEDDIV', 'SETGRAVITY',
-    'SETGRAVITYDIRECT', 'SETAIRCONTROL',
-    'SETAIRCONTROLDIRECT', 'CLEARINVENTORY', 'GIVEINVENTORY',
-    'GIVEINVENTORYDIRECT', 'TAKEINVENTORY',
-    'TAKEINVENTORYDIRECT', 'CHECKINVENTORY',
-    'CHECKINVENTORYDIRECT', 'SPAWN', 'SPAWNDIRECT',
-    'SPAWNSPOT', 'SPAWNSPOTDIRECT', 'SETMUSIC',
-    'SETMUSICDIRECT', 'LOCALSETMUSIC', 'LOCALSETMUSICDIRECT',
-    'PRINTFIXED', 'PRINTLOCALIZED', 'MOREHUDMESSAGE',
-    'OPTHUDMESSAGE', 'ENDHUDMESSAGE', 'ENDHUDMESSAGEBOLD',
-    'SETSTYLE', 'SETSTYLEDIRECT', 'SETFONT',
-    'SETFONTDIRECT', 'PUSHBYTE', 'LSPEC1DIRECTB',
-    'LSPEC2DIRECTB', 'LSPEC3DIRECTB', 'LSPEC4DIRECTB',
-    'LSPEC5DIRECTB', 'DELAYDIRECTB', 'RANDOMDIRECTB',
-    'PUSHBYTES', 'PUSH2BYTES', 'PUSH3BYTES', 'PUSH4BYTES',
-    'PUSH5BYTES', 'SETTHINGSPECIAL', 'ASSIGNGLOBALVAR',
-    'PUSHGLOBALVAR', 'ADDGLOBALVAR', 'SUBGLOBALVAR',
-    'MULGLOBALVAR', 'DIVGLOBALVAR', 'MODGLOBALVAR',
-    'INCGLOBALVAR', 'DECGLOBALVAR', 'FADETO', 'FADERANGE',
-    'CANCELFADE', 'PLAYMOVIE', 'SETFLOORTRIGGER',
-    'SETCEILINGTRIGGER', 'GETACTORX', 'GETACTORY',
-    'GETACTORZ', 'STARTTRANSLATION', 'TRANSLATIONRANGE1',
-    'TRANSLATIONRANGE2', 'ENDTRANSLATION', 'CALL',
-    'CALLDISCARD', 'RETURNVOID', 'RETURNVAL',
-    'PUSHMAPARRAY', 'ASSIGNMAPARRAY', 'ADDMAPARRAY',
-    'SUBMAPARRAY', 'MULMAPARRAY', 'DIVMAPARRAY',
-    'MODMAPARRAY', 'INCMAPARRAY', 'DECMAPARRAY', 'DUP',
-    'SWAP', 'WRITETOINI', 'GETFROMINI', 'SIN', 'COS',
-    'VECTORANGLE', 'CHECKWEAPON', 'SETWEAPON',
-    'TAGSTRING', 'PUSHWORLDARRAY', 'ASSIGNWORLDARRAY',
-    'ADDWORLDARRAY', 'SUBWORLDARRAY', 'MULWORLDARRAY',
-    'DIVWORLDARRAY', 'MODWORLDARRAY', 'INCWORLDARRAY',
-    'DECWORLDARRAY', 'PUSHGLOBALARRAY', 'ASSIGNGLOBALARRAY',
-    'ADDGLOBALARRAY', 'SUBGLOBALARRAY', 'MULGLOBALARRAY',
-    'DIVGLOBALARRAY', 'MODGLOBALARRAY', 'INCGLOBALARRAY',
-    'DECGLOBALARRAY', 'SETMARINEWEAPON', 'SETACTORPROPERTY',
-    'GETACTORPROPERTY', 'PLAYERNUMBER', 'ACTIVATORTID',
-    'SETMARINESPRITE', 'GETSCREENWIDTH', 'GETSCREENHEIGHT',
-    'THING_PROJECTILE2', 'STRLEN', 'SETHUDSIZE',
-    'GETCVAR', 'CASEGOTOSORTED', 'SETRESULTVALUE',
-    'GETLINEROWOFFSET', 'GETACTORFLOORZ', 'GETACTORANGLE',
-    'GETSECTORFLOORZ', 'GETSECTORCEILINGZ', 'LSPEC5RESULT',
-    'GETSIGILPIECES', 'GETLEVELINFO', 'CHANGESKY',
-    'PLAYERINGAME', 'PLAYERISBOT', 'SETCAMERATOTEXTURE',
-    'ENDLOG', 'GETAMMOCAPACITY', 'SETAMMOCAPACITY',
-    'PRINTMAPCHARARRAY', 'PRINTWORLDCHARARRAY',
-    'PRINTGLOBALCHARARRAY', 'SETACTORANGLE', 'GRABINPUT',
-    'SETMOUSEPOINTER', 'MOVEMOUSEPOINTER', 'SPAWNPROJECTILE',
-    'GETSECTORLIGHTLEVEL', 'GETACTORCEILINGZ',
-    'SETACTORPOSITION', 'CLEARACTORINVENTORY',
-    'GIVEACTORINVENTORY', 'TAKEACTORINVENTORY',
-    'CHECKACTORINVENTORY', 'THINGCOUNTNAME',
-    'SPAWNSPOTFACING', 'PLAYERCLASS', 'ANDSCRIPTVAR',
-    'ANDMAPVAR', 'ANDWORLDVAR', 'ANDGLOBALVAR',
-    'ANDMAPARRAY', 'ANDWORLDARRAY', 'ANDGLOBALARRAY',
-    'EORSCRIPTVAR', 'EORMAPVAR', 'EORWORLDVAR',
-    'EORGLOBALVAR', 'EORMAPARRAY', 'EORWORLDARRAY',
-    'EORGLOBALARRAY', 'ORSCRIPTVAR', 'ORMAPVAR',
-    'ORWORLDVAR', 'ORGLOBALVAR', 'ORMAPARRAY',
-    'ORWORLDARRAY', 'ORGLOBALARRAY', 'LSSCRIPTVAR',
-    'LSMAPVAR', 'LSWORLDVAR', 'LSGLOBALVAR', 'LSMAPARRAY',
-    'LSWORLDARRAY', 'LSGLOBALARRAY', 'RSSCRIPTVAR',
-    'RSMAPVAR', 'RSWORLDVAR', 'RSGLOBALVAR', 'RSMAPARRAY',
-    'RSWORLDARRAY', 'RSGLOBALARRAY', 'GETPLAYERINFO',
-    'CHANGELEVEL', 'SECTORDAMAGE', 'REPLACETEXTURES',
-    'NEGATEBINARY', 'GETACTORPITCH', 'SETACTORPITCH',
-    'PRINTBIND', 'SETACTORSTATE', 'THINGDAMAGE2',
-    'USEINVENTORY', 'USEACTORINVENTORY',
-    'CHECKACTORCEILINGTEXTURE', 'CHECKACTORFLOORTEXTURE',
-    'GETACTORLIGHTLEVEL', 'SETMUGSHOTSTATE',
-    'THINGCOUNTSECTOR', 'THINGCOUNTNAMESECTOR',
-    'CHECKPLAYERCAMERA', 'MORPHACTOR', 'UNMORPHACTOR',
-    'GETPLAYERINPUT', 'CLASSIFYACTOR', 'PRINTBINARY',
-    'PRINTHEX','CALLFUNC','STRPARAM']
+	'NOP',
+	'TERMINATE',
+	'SUSPEND',
+	'PUSHNUMBER',
+	'LSPEC1',
+	'LSPEC2',
+	'LSPEC3',
+	'LSPEC4',
+	'LSPEC5',
+	'LSPEC1DIRECT',
+	'LSPEC2DIRECT',
+	'LSPEC3DIRECT',
+	'LSPEC4DIRECT',
+	'LSPEC5DIRECT',
+	'ADD',
+	'SUBTRACT',
+	'MULTIPLY',
+	'DIVIDE',
+	'MODULUS',
+	'EQ',
+	'NE',
+	'LT',
+	'GT',
+	'LE',
+	'GE',
+	'ASSIGNSCRIPTVAR',
+	'ASSIGNMAPVAR',
+	'ASSIGNWORLDVAR',
+	'PUSHSCRIPTVAR',
+	'PUSHMAPVAR',
+	'PUSHWORLDVAR',
+	'ADDSCRIPTVAR',
+	'ADDMAPVAR',
+	'ADDWORLDVAR',
+	'SUBSCRIPTVAR',
+	'SUBMAPVAR',
+	'SUBWORLDVAR',
+	'MULSCRIPTVAR',
+	'MULMAPVAR',
+	'MULWORLDVAR',
+	'DIVSCRIPTVAR',
+	'DIVMAPVAR',
+	'DIVWORLDVAR',
+	'MODSCRIPTVAR',
+	'MODMAPVAR',
+	'MODWORLDVAR',
+	'INCSCRIPTVAR',
+	'INCMAPVAR',
+	'INCWORLDVAR',
+	'DECSCRIPTVAR',
+	'DECMAPVAR',
+	'DECWORLDVAR',
+	'GOTO',
+	'IFGOTO',
+	'DROP',
+	'DELAY',
+	'DELAYDIRECT',
+	'RANDOM',
+	'RANDOMDIRECT',
+	'THINGCOUNT',
+	'THINGCOUNTDIRECT',
+	'TAGWAIT',
+	'TAGWAITDIRECT',
+	'POLYWAIT',
+	'POLYWAITDIRECT',
+	'CHANGEFLOOR',
+	'CHANGEFLOORDIRECT',
+	'CHANGECEILING',
+	'CHANGECEILINGDIRECT',
+	'RESTART',
+	'ANDLOGICAL',
+	'ORLOGICAL',
+	'ANDBITWISE',
+	'ORBITWISE',
+	'EORBITWISE',
+	'NEGATELOGICAL',
+	'LSHIFT',
+	'RSHIFT',
+	'UNARYMINUS',
+	'IFNOTGOTO',
+	'LINESIDE',
+	'SCRIPTWAIT',
+	'SCRIPTWAITDIRECT',
+	'CLEARLINESPECIAL',
+	'CASEGOTO',
+	'BEGINPRINT',
+	'ENDPRINT',
+	'PRINTSTRING',
+	'PRINTNUMBER',
+	'PRINTCHARACTER',
+	'PLAYERCOUNT',
+	'GAMETYPE',
+	'GAMESKILL',
+	'TIMER',
+	'SECTORSOUND',
+	'AMBIENTSOUND',
+	'SOUNDSEQUENCE',
+	'SETLINETEXTURE',
+	'SETLINEBLOCKING',
+	'SETLINESPECIAL',
+	'THINGSOUND',
+	'ENDPRINTBOLD',
+# [RH] End of Hexen p-codes
+	'ACTIVATORSOUND',
+	'LOCALAMBIENTSOUND',
+	'SETLINEMONSTERBLOCKING',
+# [BC] Start of new pcodes
+	'PLAYERBLUESKULL',
+	'PLAYERREDSKULL',
+	'PLAYERYELLOWSKULL',
+	'PLAYERMASTERSKULL',
+	'PLAYERBLUECARD',
+	'PLAYERREDCARD',
+	'PLAYERYELLOWCARD',
+	'PLAYERMASTERCARD',
+	'PLAYERBLACKSKULL',
+	'PLAYERSILVERSKULL',
+	'PLAYERGOLDSKULL',
+	'PLAYERBLACKCARD',
+	'PLAYERSILVERCARD',
+	'ISNETWORKGAME',
+	'PLAYERTEAM',
+	'PLAYERHEALTH',
+	'PLAYERARMORPOINTS',
+	'PLAYERFRAGS',
+	'PLAYEREXPERT',
+	'BLUETEAMCOUNT',
+	'REDTEAMCOUNT',
+	'BLUETEAMSCORE',
+	'REDTEAMSCORE',
+	'ISONEFLAGCTF',
+	'GETINVASIONWAVE',
+	'GETINVASIONSTATE',
+	'PRINTNAME',
+	'MUSICCHANGE',
+	'CONSOLECOMMANDDIRECT',
+	'CONSOLECOMMAND',
+	'SINGLEPLAYER',
+# [RH] End of Skull Tag p-codes
+	'FIXEDMUL',
+	'FIXEDDIV',
+	'SETGRAVITY',
+	'SETGRAVITYDIRECT',
+	'SETAIRCONTROL',
+	'SETAIRCONTROLDIRECT',
+	'CLEARINVENTORY',
+	'GIVEINVENTORY',
+	'GIVEINVENTORYDIRECT',
+	'TAKEINVENTORY',
+	'TAKEINVENTORYDIRECT',
+	'CHECKINVENTORY',
+	'CHECKINVENTORYDIRECT',
+	'SPAWN',
+	'SPAWNDIRECT',
+	'SPAWNSPOT',
+	'SPAWNSPOTDIRECT',
+	'SETMUSIC',
+	'SETMUSICDIRECT',
+	'LOCALSETMUSIC',
+	'LOCALSETMUSICDIRECT',
+	'PRINTFIXED',
+	'PRINTLOCALIZED',
+	'MOREHUDMESSAGE',
+	'OPTHUDMESSAGE',
+	'ENDHUDMESSAGE',
+	'ENDHUDMESSAGEBOLD',
+	'SETSTYLE',
+	'SETSTYLEDIRECT',
+	'SETFONT',
+	'SETFONTDIRECT',
+	'PUSHBYTE',		# Valid in compact-script mode only
+	'LSPEC1DIRECTB',	# "
+	'LSPEC2DIRECTB',	# "
+	'LSPEC3DIRECTB',	# "
+	'LSPEC4DIRECTB',	# "
+	'LSPEC5DIRECTB',	# "
+	'DELAYDIRECTB',	# "
+	'RANDOMDIRECTB',	# "
+	'PUSHBYTES',		# "
+	'PUSH2BYTES',		# "
+	'PUSH3BYTES',		# "
+	'PUSH4BYTES',		# "
+	'PUSH5BYTES',		# "
+	'SETTHINGSPECIAL',
+	'ASSIGNGLOBALVAR',
+	'PUSHGLOBALVAR',
+	'ADDGLOBALVAR',
+	'SUBGLOBALVAR',
+	'MULGLOBALVAR',
+	'DIVGLOBALVAR',
+	'MODGLOBALVAR',
+	'INCGLOBALVAR',
+	'DECGLOBALVAR',
+	'FADETO',
+	'FADERANGE',
+	'CANCELFADE',
+	'PLAYMOVIE',
+	'SETFLOORTRIGGER',
+	'SETCEILINGTRIGGER',
+	'GETACTORX',
+	'GETACTORY',
+	'GETACTORZ',
+	'STARTTRANSLATION',
+	'TRANSLATIONRANGE1',
+	'TRANSLATIONRANGE2',
+	'ENDTRANSLATION',
+	'CALL',
+	'CALLDISCARD',
+	'RETURNVOID',
+	'RETURNVAL',
+	'PUSHMAPARRAY',
+	'ASSIGNMAPARRAY',
+	'ADDMAPARRAY',
+	'SUBMAPARRAY',
+	'MULMAPARRAY',
+	'DIVMAPARRAY',
+	'MODMAPARRAY',
+	'INCMAPARRAY',
+	'DECMAPARRAY',
+	'DUP',
+	'SWAP',
+	'WRITETOINI',
+	'GETFROMINI',
+	'SIN',
+	'COS',
+	'VECTORANGLE',
+	'CHECKWEAPON',
+	'SETWEAPON',
+	'TAGSTRING',
+	'PUSHWORLDARRAY',
+	'ASSIGNWORLDARRAY',
+	'ADDWORLDARRAY',
+	'SUBWORLDARRAY',
+	'MULWORLDARRAY',
+	'DIVWORLDARRAY',
+	'MODWORLDARRAY',
+	'INCWORLDARRAY',
+	'DECWORLDARRAY',
+	'PUSHGLOBALARRAY',
+	'ASSIGNGLOBALARRAY',
+	'ADDGLOBALARRAY',
+	'SUBGLOBALARRAY',
+	'MULGLOBALARRAY',
+	'DIVGLOBALARRAY',
+	'MODGLOBALARRAY',
+	'INCGLOBALARRAY',
+	'DECGLOBALARRAY',
+	'SETMARINEWEAPON',
+	'SETACTORPROPERTY',
+	'GETACTORPROPERTY',
+	'PLAYERNUMBER',
+	'ACTIVATORTID',
+	'SETMARINESPRITE',
+	'GETSCREENWIDTH',
+	'GETSCREENHEIGHT',
+	'THING_PROJECTILE2',
+	'STRLEN',
+	'SETHUDSIZE',
+	'GETCVAR',
+	'CASEGOTOSORTED',
+	'SETRESULTVALUE',
+	'GETLINEROWOFFSET',
+	'GETACTORFLOORZ',
+	'GETACTORANGLE',
+	'GETSECTORFLOORZ',
+	'GETSECTORCEILINGZ',
+	'LSPEC5RESULT',
+	'GETSIGILPIECES',
+	'GETLEVELINFO',
+	'CHANGESKY',
+	'PLAYERINGAME',
+	'PLAYERISBOT',
+	'SETCAMERATOTEXTURE',
+	'ENDLOG',
+	'GETAMMOCAPACITY',
+	'SETAMMOCAPACITY',
+# [JB] start of new pcodes
+	'PRINTMAPCHARARRAY',
+	'PRINTWORLDCHARARRAY',
+	'PRINTGLOBALCHARARRAY',
+# [JB] end of new pcodes
+	'SETACTORANGLE',
+	'GRABINPUT',
+	'SETMOUSEPOINTER',
+	'MOVEMOUSEPOINTER',
+	'SPAWNPROJECTILE',
+	'GETSECTORLIGHTLEVEL',
+	'GETACTORCEILINGZ',
+	'SETACTORPOSITION',
+	'CLEARACTORINVENTORY',
+	'GIVEACTORINVENTORY',
+	'TAKEACTORINVENTORY',
+	'CHECKACTORINVENTORY',
+	'THINGCOUNTNAME',
+	'SPAWNSPOTFACING',
+	'PLAYERCLASS',
+	#[MW] start my p-codes
+	'ANDSCRIPTVAR',
+	'ANDMAPVAR',
+	'ANDWORLDVAR',
+	'ANDGLOBALVAR',
+	'ANDMAPARRAY',
+	'ANDWORLDARRAY',
+	'ANDGLOBALARRAY',
+	'EORSCRIPTVAR',
+	'EORMAPVAR',
+	'EORWORLDVAR',
+	'EORGLOBALVAR',
+	'EORMAPARRAY',
+	'EORWORLDARRAY',
+	'EORGLOBALARRAY',
+	'ORSCRIPTVAR',
+	'ORMAPVAR',
+	'ORWORLDVAR',
+	'ORGLOBALVAR',
+	'ORMAPARRAY',
+	'ORWORLDARRAY',
+	'ORGLOBALARRAY',
+	'LSSCRIPTVAR',
+	'LSMAPVAR',
+	'LSWORLDVAR',
+	'LSGLOBALVAR',
+	'LSMAPARRAY',
+	'LSWORLDARRAY',
+	'LSGLOBALARRAY',
+	'RSSCRIPTVAR',
+	'RSMAPVAR',
+	'RSWORLDVAR',
+	'RSGLOBALVAR',
+	'RSMAPARRAY',
+	'RSWORLDARRAY',
+	'RSGLOBALARRAY',
+	#[MW] end my p-codes
+	'GETPLAYERINFO',
+	'CHANGELEVEL',
+	'SECTORDAMAGE',
+	'REPLACETEXTURES',
+	'NEGATEBINARY',
+	'GETACTORPITCH',
+	'SETACTORPITCH',
+	'PRINTBIND',
+	'SETACTORSTATE',
+	'THINGDAMAGE2',
+	'USEINVENTORY',
+	'USEACTORINVENTORY',
+	'CHECKACTORCEILINGTEXTURE',
+	'CHECKACTORFLOORTEXTURE',
+	'GETACTORLIGHTLEVEL',
+	'SETMUGSHOTSTATE',
+	'THINGCOUNTSECTOR',
+	'THINGCOUNTNAMESECTOR',
+	'CHECKPLAYERCAMERA',
+	'MORPHACTOR',
+	'UNMORPHACTOR',
+	'GETPLAYERINPUT',
+	'CLASSIFYACTOR',
+	'PRINTBINARY',
+	'PRINTHEX',
+	'CALLFUNC',
+	'SAVESTRING',		# was SAVESTRING # [FDARI]
+	'PRINTMAPCHRANGE',	# [FDARI] output range
+	'PRINTWORLDCHRANGE',
+	'PRINTGLOBALCHRANGE',
+	'STRCPYTOMAPCHRANGE',	# [FDARI] input range
+	'STRCPYTOWORLDCHRANGE',
+	'STRCPYTOGLOBALCHRANGE',
+	'PUSHFUNCTION',		# from Eternity
+	'CALLSTACK',			# from Eternity
+	'SCRIPTWAITNAMED',
+	'TRANSLATIONRANGE3',
+	'GOTOSTACK',
+	'ASSIGNSCRIPTARRAY',
+	'PUSHSCRIPTARRAY',
+	'ADDSCRIPTARRAY',
+	'SUBSCRIPTARRAY',
+	'MULSCRIPTARRAY',
+	'DIVSCRIPTARRAY',
+	'MODSCRIPTARRAY',
+	'INCSCRIPTARRAY',
+	'DECSCRIPTARRAY',
+	'ANDSCRIPTARRAY',
+	'EORSCRIPTARRAY',
+	'ORSCRIPTARRAY',
+	'LSSCRIPTARRAY',
+	'RSSCRIPTARRAY',
+	'PRINTSCRIPTCHARARRAY',
+	'PRINTSCRIPTCHRANGE',
+	'STRCPYTOSCRIPTCHRANGE',
+	'LSPEC5EX',
+	'LSPEC5EXRESULT',
+	'TRANSLATIONRANGE4',
+	'TRANSLATIONRANGE5',
+]
 
 linespecials = [
     None, None, 'Polyobj_RotateLeft',
@@ -2240,12 +2540,201 @@ aprop_names = [
     ('APROP_DamageType', True),
 ]
 
+# TODO parse zspecial instead of hardcoding
+ext_specials = {
+	-1:'GetLineUDMFInt',
+	-2:'GetLineUDMFFixed',
+	-3:'GetThingUDMFInt',
+	-4:'GetThingUDMFFixed',
+	-5:'GetSectorUDMFInt',
+	-6:'GetSectorUDMFFixed',
+	-7:'GetSideUDMFInt',
+	-8:'GetSideUDMFFixed',
+	-9:'GetActorVelX',
+	-10:'GetActorVelY',
+	-11:'GetActorVelZ',
+	-12:'SetActivator',
+	-13:'SetActivatorToTarget',
+	-14:'GetActorViewHeight',
+	-15:'GetChar',
+	-16:'GetAirSupply',
+	-17:'SetAirSupply',
+	-18:'SetSkyScrollSpeed',
+	-19:'GetArmorType',
+	-20:'SpawnSpotForced',
+	-21:'SpawnSpotFacingForced',
+	-22:'CheckActorProperty',
+	-23:'SetActorVelocity',
+	-24:'SetUserVariable',
+	-25:'GetUserVariable',
+	-26:'Radius_Quake2',
+	-27:'CheckActorClass',
+	-28:'SetUserArray',
+	-29:'GetUserArray',
+	-30:'SoundSequenceOnActor',
+	-31:'SoundSequenceOnSector',
+	-32:'SoundSequenceOnPolyobj',
+	-33:'GetPolyobjX',
+	-34:'GetPolyobjY',
+	-35:'CheckSight',
+	-36:'SpawnForced',
+	-37:'AnnouncerSound',
+	-38:'SetPointer',
+	-39:'ACS_NamedExecute',
+	-40:'ACS_NamedSuspend',
+	-41:'ACS_NamedTerminate',
+	-42:'ACS_NamedLockedExecute',
+	-43:'ACS_NamedLockedExecuteDoor',
+	-44:'ACS_NamedExecuteWithResult',
+	-45:'ACS_NamedExecuteAlways',
+	-46:'UniqueTID',
+	-47:'IsTIDUsed',
+	-48:'Sqrt',
+	-49:'FixedSqrt',
+	-50:'VectorLength',
+	-51:'SetHUDClipRect',
+	-52:'SetHUDWrapWidth',
+	-53:'SetCVar',
+	-54:'GetUserCVar',
+	-55:'SetUserCVar',
+	-56:'GetCVarString',
+	-57:'SetCVarString',
+	-58:'GetUserCVarString',
+	-59:'SetUserCVarString',
+	-60:'LineAttack',
+	-61:'PlaySound',
+	-62:'StopSound',
+	-63:'strcmp',
+	-64:'stricmp',
+	-64:'strcasecmp',
+	-65:'StrLeft',
+	-66:'StrRight',
+	-67:'StrMid',
+	-68:'GetActorClass',
+	-69:'GetWeapon',
+	-70:'SoundVolume',
+	-71:'PlayActorSound',
+	-72:'SpawnDecal',
+	-73:'CheckFont',
+	-74:'DropItem',
+	-75:'CheckFlag',
+	-76:'SetLineActivation',
+	-77:'GetLineActivation',
+	-78:'GetActorPowerupTics',
+	-79:'ChangeActorAngle',
+	-80:'ChangeActorPitch',
+	-81:'GetArmorInfo',
+	-82:'DropInventory',
+	-83:'PickActor',
+	-84:'IsPointerEqual',
+	-85:'CanRaiseActor',
+	-86:'SetActorTeleFog',
+	-87:'SwapActorTeleFog',
+	-88:'SetActorRoll',
+	-89:'ChangeActorRoll',
+	-90:'GetActorRoll',
+	-91:'QuakeEx',
+	-92:'Warp',
+	-93:'GetMaxInventory',
+	-94:'SetSectorDamage',
+	-95:'SetSectorTerrain',
+	-96:'SpawnParticle',
+	-97:'SetMusicVolume',
+	-98:'CheckProximity',
+	-99:'CheckActorState',
+
+	# Zandronum's
+	-100:'ResetMap',
+	-101:'PlayerIsSpectator',
+	-102:'ConsolePlayerNumber',
+	-103:'GetTeamProperty',
+	-104:'GetPlayerLivesLeft',
+	-105:'SetPlayerLivesLeft',
+	-106:'KickFromGame',
+	-107:'GetGamemodeState',
+	-108:'SetDBEntry',
+	-109:'GetDBEntry',
+	-110:'SetDBEntryString',
+	-111:'GetDBEntryString',
+	-112:'IncrementDBEntry',
+	-113:'PlayerIsLoggedIn',
+	-114:'GetPlayerAccountName',
+	-115:'SortDBEntries',
+	-116:'CountDBResults',
+	-117:'FreeDBResults',
+	-118:'GetDBResultKeyString',
+	-119:'GetDBResultValueString',
+	-120:'GetDBResultValue',
+	-121:'GetDBEntryRank',
+	-122:'RequestScriptPuke',
+	-123:'BeginDBTransaction',
+	-124:'EndDBTransaction',
+	-125:'GetDBEntries',
+	-126:'NamedRequestScriptPuke',
+	-127:'SystemTime',
+	-128:'GetTimeProperty',
+	-129:'Strftime',
+	-130:'SetDeadSpectator',
+	-131:'SetActivatorToPlayer',
+	-132:'SetCurrentGamemode',
+	-133:'GetCurrentGamemode',
+	-134:'SetGamemodeLimit',
+	-135:'SetPlayerClass',
+	-136:'SetPlayerChasecam',
+	-137:'GetPlayerChasecam',
+	-138:'SetPlayerScore',
+	-139:'GetPlayerScore',
+	-140:'InDemoMode',
+	-141:'SetActionScript',
+	-142:'SetPredictableValue',
+	-143:'GetPredictableValue',
+	-144:'SetEffectActor',
+	-149:'CheckSolidFooting',
+	-150:'GetNetworkState',
+	-151:'SetPlayerWeaponZoomFactor',
+	-152:'SetPlayerSkin',
+	-153:'SetNetworkReplicationFlags',
+	-154:'UnlaggedReconcile',
+	-155:'UnlaggedRestore',
+	-156:'SyncPlayerNetwork',
+
+	# -1xx are reserved for Zandronum
+	-200:'CheckClass',
+	-201:'DamageActor',
+	-202:'SetActorFlag',
+	-203:'SetTranslation',
+	-204:'GetActorFloorTexture',
+	-205:'GetActorFloorTerrain',
+	-206:'StrArg',
+	-207:'Floor',
+	-208:'Round',
+	-209:'Ceil',
+	-210:'ScriptCall',
+	-211:'StartSlideshow',
+	-212:'GetSectorHealth',
+	-213:'GetLineHealth',
+
+
+	# Eternity's
+	-300:'GetLineX',
+	-301:'GetLineY',
+	-302:'SetAirFriction',
+
+	# GZDoom OpenGL
+	-400:'SetSectorGlow',
+	-401:'SetFogDensity',
+
+	# ZDaemon's
+	-19620:'GetTeamScore',
+	-19621:'SetTeamScore',
+}
+
 pcode_index = {}
-g = globals()
+#g = globals()
 for i, n in enumerate(pcode_names):
-    g['PCD_' + n] = i
+    #g['PCD_' + n] = i
     pcode_index[n] = i
 
 pcodes = genpcodes()
 
-del i, n, g
+del i, n#, g

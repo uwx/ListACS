@@ -88,10 +88,10 @@ class GotoParser(acsutil.Parser):
         return 'goto block%d' % tgt.id
 
     def label_code(self, tgt):
-        return ' block%s:' % tgt.id
+        return f' block{tgt.id}:'
 
     def prefix_code(self):
-        yield '%s' % (self.script.getlabel())
+        yield f'{self.script.getlabel()}'
 
     def suffix_code(self):
         yield ''
@@ -100,7 +100,7 @@ class GotoParser(acsutil.Parser):
         addrs = self.targets.keys()
         sorted(addrs)
         self.blocks = blocks = []
-        for i, a in enumerate(addrs):
+        for a in addrs:
             tgt = self.targets[a]
             if tgt.entries > 1:
                 tgt.id = len(blocks) + 1
@@ -108,26 +108,21 @@ class GotoParser(acsutil.Parser):
 
         yield self.script.getheader()
         yield '{'
-        vars = ['local%d' % v for v in self.locals.vars if v >= self.script.argc]
-        if vars:
+        if vars := ['local%d' % v for v in self.locals.vars if v >= self.script.argc]:
             vars.sort()
-            yield '    int %s;' % ', '.join(vars)
+            yield f"    int {', '.join(vars)};"
 
-        for l in self.prefix_code():
-            yield l
-
+        yield from self.prefix_code()
         self.stgt.id = 0
 
         for tgt in blocks:
-            lbl = self.label_code(tgt)
-            if lbl:
+            if lbl := self.label_code(tgt):
                 yield lbl
             for l in tgt.block.genlines(self):
                 yield self.spaces + l
             yield ''
 
-        for l in self.suffix_code():
-            yield l
+        yield from self.suffix_code()
         yield '}'
 
 
@@ -142,10 +137,7 @@ class SwitchParserScript(GotoParser):
             return '    case %d:' % tgt.id
 
     def restart_code(self):
-        if len(self.blocks) == 1:
-            return 'restart'
-        else:
-            return 'goto_block = 0; restart'
+        return 'restart' if len(self.blocks) == 1 else 'goto_block = 0; restart'
 
     def prefix_code(self):
         if len(self.blocks) == 1:
@@ -182,34 +174,33 @@ class SwitchParserFunction(GotoParser):
             yield '        }'
             yield '    }'
 
-        if not self.script.isvoid:
-            yield '    return 0;'
+        #if not self.script.isvoid:
+        #    yield '    return 0;'
 
 
 def declare_mapvars(acsf, seq):
     for var in seq:
         val = var.initval
-        i = var.id
+        #i = var.id
         isarray = not isinstance(val, int)
         isstring = var.is_string()
         if isarray:
             if isstring:
-                yield 'int map%d[%d] = {%s};' % \
-                    (i, len(val), ', '.join(acsf.getstring(v) for v in val))
+                yield 'int %s[%d] = {%s};' % \
+                    (var.name, len(val), ', '.join(acsf.getstring(v) for v in val))
             else:
-                yield 'int map%d[%d] = {%s};' % \
-                    (i, len(val), ', '.join(str(v) for v in val))
+                yield 'int %s[%d] = {%s};' % \
+                    (var.name, len(val), ', '.join(str(v) for v in val))
+        elif isstring:
+            yield f'int {var.name} = {acsf.getstring(val)}; '
         else:
-            if isstring:
-                yield 'int map%d = %s; ' % (i, acsf.getstring(val))
-            else:
-                yield 'int map%d = %d;' % (i, val)
+            yield 'int %s = %d;' % (var.name, val)
+
         if isarray:
             if not var.isarray:
-                yield '// Warning: array map%d[] not used as array' % i
-        else:
-            if var.isarray:
-                yield '// Warning: variable map%d used as array' % i
+                yield f'// Warning: array {var.name}[] not used as array'
+        elif var.isarray:
+            yield f'// Warning: variable {var.name} used as array'
 
 
 def declare_vars(seq, type):
@@ -221,10 +212,10 @@ def declare_vars(seq, type):
 
 
 def getvars(acsf, type):
-    vars = acsf.vars[type].vars
-    varids = vars.keys()
+    vars1 = acsf.vars[type].vars
+    varids = vars1.keys()
     for id in sorted(varids):
-        yield vars[id]
+        yield vars1[id]
 
 
 def main():
@@ -234,27 +225,19 @@ def main():
         return
 
     if opts.wad:
-        f = open(opts.wad, 'rb')
-        wad = doomwad.WadFile(f)
-        f.close()
-
+        with open(opts.wad, 'rb') as f:
+            wad = doomwad.WadFile(f)
         dat = wad[args[0]].data
     else:
         dat = open(args[0], 'rb').read()
 
     acsf = acsutil.Behavior(dat)
 
-    comment = ''
-    if opts.comment:
-        comment = '// '
-
-    if opts.output:
-        output = open(opts.output, 'w')
-    else:
-        output = sys.stdout
+    comment = '// ' if opts.comment else ''
+    output = open(opts.output, 'w') if opts.output else sys.stdout
 
     if opts.strings:
-        print('%sStrings:' % comment, file=output)
+        print(f'{comment}Strings:', file=output)
         for i, s in enumerate(acsf.strings):
             print('%s  %3d: %r' % (comment, i, s), file=output)
         print('', file=output)
@@ -293,7 +276,7 @@ def main():
             print('', file=output)
         for m in acsf.markers:
             for lin in m.disassemble():
-                print('%s%s' % (comment, lin), file=output)
+                print(f'{comment}{lin}', file=output)
 
 
 if sys.hexversion < 0x3070000:
