@@ -1036,15 +1036,15 @@ class Goto(Instruction):
         return self.pcode.name + ' %d' % self.next
 
     def normalize(self):
-        next = self.next
-        if next is None:
+        next2 = self.next
+        if next2 is None:
             self.next.inst = self
             return self
 
         self.next = None
-        next.normalize()
-        self.next = next
-        return next.inst
+        next2.normalize()
+        self.next = next2
+        return next2.inst
 
 
 class IfGoto(Instruction):
