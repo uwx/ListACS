@@ -1333,7 +1333,7 @@ class PrintArrayRange(Instruction):
         Instruction.parse(self, p)
 
     def tocode(self, p):
-        return f'a:({self.val.tocode(p)},{self.offset.tocode(p)},{self.capacity.tocode(p)})'
+        return (self.capacity is Literal and self.capacity.constvalue() != 2147483647) and f'a:({self.val.tocode(p)},{self.offset.tocode(p)},{self.capacity.tocode(p)})' or f'a:({self.val.tocode(p)},{self.offset.tocode(p)})'
 
     @staticmethod
     def interpret(val, p):
