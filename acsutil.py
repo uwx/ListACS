@@ -1280,7 +1280,7 @@ class BeginPrint(Instruction):
 
 
 class PrintItem(Instruction):
-    def parse(self, p, code, *args):
+    def parse(self, p: Parser, code, *args):
         self.code = code
         self.val = self.interpret(p.pop(), p)
         pr = p.top
@@ -1302,9 +1302,39 @@ class PrintString(PrintItem):
         return val.lookupstring(p)
 
 
-class PrintArray(PrintItem):
-    pass
+class PrintArray(Instruction):
+    def parse(self, p: Parser, vartype, *args):
+        self.val = p.lookupvar(vartype.type, p.pop().constvalue())
+        self.offset = self.interpret(p.pop(), p)
+        pr = p.top
+        with contextlib.suppress(Exception):
+            pr.appenditem(self)
+        Instruction.parse(self, p)
 
+    def tocode(self, p):
+        return self.offset.constvalue() != 0 and f'a:({self.val.tocode(p)},{self.offset.tocode(p)})' or f'a:({self.val.tocode(p)}'
+
+    @staticmethod
+    def interpret(val, p):
+        return val
+
+class PrintArrayRange(Instruction):
+    def parse(self, p: Parser, vartype, *args):
+        self.capacity = self.interpret(p.pop(), p)
+        self.offset = self.interpret(p.pop(), p)
+        self.val = p.lookupvar(vartype.type, p.pop().constvalue())
+        self.offset2 = self.interpret(p.pop(), p) # no idea what this is used for
+        pr = p.top
+        with contextlib.suppress(Exception):
+            pr.appenditem(self)
+        Instruction.parse(self, p)
+
+    def tocode(self, p):
+        return f'a:({self.val.tocode(p)},{self.offset.tocode(p)},{self.capacity.tocode(p)})'
+
+    @staticmethod
+    def interpret(val, p):
+        return val
 
 class CreateTranslation(Instruction):
     def parse(self, p):
@@ -1986,6 +2016,9 @@ def genpcodes():
     pcode('PRINTMAPCHARARRAY', PrintArray, MapVar)
     pcode('PRINTWORLDCHARARRAY', PrintArray, WorldVar)
     pcode('PRINTGLOBALCHARARRAY', PrintArray, GlobalVar)
+    pcode('PRINTMAPCHRANGE', PrintArrayRange, MapVar)
+    pcode('PRINTWORLDCHRANGE', PrintArrayRange, WorldVar)
+    pcode('PRINTGLOBALCHRANGE', PrintArrayRange, GlobalVar)
     pcode('PRINTBIND', PrintString, 'k')
     pcode('PRINTBINARY', PrintItem, 'b')
     pcode('PRINTHEX', PrintItem, 'x')
