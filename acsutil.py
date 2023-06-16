@@ -669,6 +669,9 @@ class Parser(ScriptIO):
         if pcd >= len(pcodes):
             print(f"Unsupported pcode {pcd}")
             pcd = pcodes[pcode_index['TERMINATE']]
+        elif pcodes[pcd] is None:
+            print(f"Unsupported pcode {pcd}: {pcode_names[pcd]}")
+            pcd = pcodes[pcode_index['TERMINATE']]
         else:
             pcd = pcodes[pcd]
 
